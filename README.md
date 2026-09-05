@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:journeys:0.2.0")
+implementation("com.getfounderhq:journeys:0.7.0")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:journeys-compose:0.2.0")
+implementation("com.getfounderhq:journeys-compose:0.7.0")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
