@@ -1,0 +1,33 @@
+{
+  "repository": "FounderHQ/founderhq-journeys-android",
+  "version": "0.1.0",
+  "sourceCommit": "dd1f15c51b546ca0360ab8883a61a21bff100e55",
+  "files": {
+    ".github/workflows/release.yml": "f7ef58c1533585964365ccc4b851e605ea76b25eb16f408935319e03716e5580",
+    ".gitignore": "838655f2e91bf2cc39b78e25f41b3706543530eeaca3c710e323d9c7fa5619ca",
+    "LICENSE": "11266b70b5ea51167849f8ff2fc81558da90acb971a670e5ee7787d8151c9ff0",
+    "README.md": "625586135d48bc86bdc34d2992665ad1fc3431b84d54364c1559e4a24ce6350c",
+    "build.gradle.kts": "24866f5d6de8b748c7a71a3f2d3ee4486e316fc2b109334d424b5209e428efc5",
+    "gradle.properties": "d5f372c6d46ad7c8d33f714bfae564eb5e1d73a159c495df9bc782b33e3567c2",
+    "gradle/wrapper/gradle-wrapper.jar": "7d3a4ac4de1c32b59bc6a4eb8ecb8e612ccd0cf1ae1e99f66902da64df296172",
+    "gradle/wrapper/gradle-wrapper.properties": "7e0821d895908883350587c74476b717016ab416320c44dc82a10def916c6fb5",
+    "gradlew": "b187b4c52e749f5760afdd6fadc31b2a98ad35fb249bf0dff03b72650f320409",
+    "gradlew.bat": "1d297e00bd21de3ace22b4d7f2de1f9dfa858883d66bbf7c1ccbecccec8f4f3b",
+    "journeys-compose/build.gradle.kts": "64a603947e482644c58c603bc433befaefa2287b33d6735395a0355e96c31d4b",
+    "journeys-compose/src/main/AndroidManifest.xml": "571f2735faf5e857752ee057ac8ef63425576a721616c60b86ee5d4c0a2d682f",
+    "journeys-compose/src/main/java/com/founderhq/journeys/compose/Journey.kt": "e1b6dff4acee5bd265ae62c0d9c1e59b54746ff58a90115f721ffcc814bb3c60",
+    "journeys/build.gradle.kts": "3e343fb3a04bdf5edd3a460ec7a472444a3761765871f7d6b50af18c871ff36c",
+    "journeys/consumer-rules.pro": "27bcf98bc3f4f9a2078ea450dade42d1dd6ade91aad25e8ec01883be0801dedf",
+    "journeys/src/main/AndroidManifest.xml": "678647a824ef7ab16066708585790ab265135d32fdf84bcd918a4b050f8891b9",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyApiClient.kt": "99fc32f9ab7a942b0f53e7e51729786c828eec329956a864e7af6e426e51602e",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyBridge.kt": "f4e0bc4ccca706b896433a6a718d46b3b79f25736f6eb8b802309c0b1ca26cd1",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyConfiguration.kt": "b1bcda693744b7b2c6a04c167bd8c341c92a4ab30997767fc789b039964c439e",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyController.kt": "98bff84fda14331fbfe674b06eb7900b387ad9f54703c0cf6bbe231425abeac2",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyListener.kt": "2b773aca26e3b1aba799cd7aed1d446e0b2a8026821c8e5523f3d1fd071a7907",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyModels.kt": "7643d15ea472105fb00c7136e6e9be50e2c9800dc0690a2f0306c144e9205ae9",
+    "journeys/src/main/java/com/founderhq/journeys/JourneyView.kt": "e6d45f75ff8dbcd2640f2080dcfd0d4183b435fb5a8c65ce8701248d7cf16d8d",
+    "journeys/src/test/java/com/founderhq/journeys/JourneyUrlsTest.kt": "458427b5cffa0bafcbb679c9f5d6a706a5ac2dd042e474c5c465763d4e87b6f6",
+    "scripts/publish.sh": "6013550cd4082fed4ccbff616c85bcff876a6493f67e863fe53345af217588d3",
+    "settings.gradle.kts": "1eecd83fb60f9a3dd61a8767d19944120b79b22d0f8d29451fc0c9d0ce386713"
+  }
+}
