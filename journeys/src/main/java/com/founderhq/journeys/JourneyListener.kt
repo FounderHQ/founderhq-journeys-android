@@ -7,7 +7,12 @@ data class JourneyError(
     override val message: String,
     val recoverable: Boolean,
     override val cause: Throwable? = null,
-) : Exception(message, cause)
+) : Exception(message, cause) {
+    var httpStatus: Int? = null
+        internal set
+    var retryAfterMillis: Long? = null
+        internal set
+}
 
 interface JourneyListener {
     fun onEvent(event: JourneyEvent) = Unit

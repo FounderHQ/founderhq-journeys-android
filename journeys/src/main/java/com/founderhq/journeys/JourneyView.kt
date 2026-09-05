@@ -1,14 +1,22 @@
 package com.founderhq.journeys
 
 import android.annotation.SuppressLint
+import android.animation.ValueAnimator
+import android.content.ComponentCallbacks2
+import android.content.res.ColorStateList
+import android.content.res.Configuration as AndroidConfiguration
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Build
+import android.os.SystemClock
 import android.util.AttributeSet
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.View
@@ -19,6 +27,9 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
@@ -31,7 +42,7 @@ import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
-import java.net.URI
+import java.util.UUID
 import java.util.concurrent.Executors
 
 class JourneyView @JvmOverloads constructor(
@@ -45,6 +56,36 @@ class JourneyView @JvmOverloads constructor(
     private var listener: JourneyListener = object : JourneyListener {}
     private var journeyConfig: JSONObject? = null
     private var rendererReady = false
+    private var rendererSupportsPreparation = false
+    private var rendererInitialized = false
+    private var preparedRendered = false
+    private var presentationRequested = false
+    private var presented = false
+    private var prepareInFlight = false
+    private var preparationGeneration = 0L
+    private var preparation: JourneyPreparation? = null
+    private var pendingPreparation: JourneyPreparation? = null
+    private var preparedAtMillis = 0L
+    private var pendingPreparedAtMillis = 0L
+    private var retryAttempt = 0
+    private var retryNotBeforeMillis = 0L
+    private val presentationDeadlineBudget =
+        JourneyForegroundDeadline(PRESENTATION_DEADLINE_MILLIS)
+    private var clientSessionId: String? = null
+    private var foreground = true
+    private val authorizationGate = JourneyAuthorizationGate()
+    private var loadedRendererUrl: String? = null
+    private var failureView: View? = null
+    private var memoryCallbacksRegistered = true
+    var readiness: JourneyReadiness = JourneyReadiness.IDLE
+        private set(value) {
+            if (field == value) return
+            field = value
+            readinessListener?.invoke(value)
+        }
+    var readinessListener: ((JourneyReadiness) -> Unit)? = null
+    val isPrepared: Boolean
+        get() = readiness == JourneyReadiness.READY || readiness == JourneyReadiness.PRESENTED
     var canGoBack: Boolean = false
         private set
     var currentStepId: String? = null
@@ -57,6 +98,15 @@ class JourneyView @JvmOverloads constructor(
     private var loadingView: View? = null
     private var lifecycleOwner: LifecycleOwner? = null
 
+    private val refreshRunnable = Runnable { refreshIfNeeded() }
+    private val presentationDeadline = Runnable {
+        presentationDeadlineBudget.finish()
+        if (presentationRequested && !presented && !disposed) {
+            readiness = JourneyReadiness.FAILED
+            showFailure(JourneyError("presentation_timeout", GENERIC_ERROR, true))
+        }
+    }
+
     /** Optional native loading and error UI factories. */
     var loadingViewFactory: ((Context) -> View)? = null
     var errorViewFactory: ((Context, JourneyError, () -> Unit) -> View)? = null
@@ -68,15 +118,46 @@ class JourneyView @JvmOverloads constructor(
         }
     }
     private val lifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            foreground = true
+            ensureWebView()
+            armPresentationDeadline()
+            refreshIfNeeded()
+            attemptInitializeRenderer()
+        }
+
         override fun onStop(owner: LifecycleOwner) {
+            foreground = false
+            mainHandler.removeCallbacks(refreshRunnable)
+            pausePresentationDeadline()
             flushCaptureForLifecycle()
+        }
+
+        override fun onDestroy(owner: LifecycleOwner) {
+            dispose()
+        }
+    }
+    private val memoryCallbacks = object : ComponentCallbacks2 {
+        override fun onConfigurationChanged(newConfig: AndroidConfiguration) {
+            setBackgroundColor(themeBackgroundColor())
+            if (failureView != null && errorViewFactory == null) {
+                showFailure(JourneyError("presentation_failed", GENERIC_ERROR, true))
+            }
+        }
+        override fun onLowMemory() = releasePreparedRendererForMemoryPressure()
+        @Suppress("DEPRECATION")
+        override fun onTrimMemory(level: Int) {
+            if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && !presented) {
+                releasePreparedRendererForMemoryPressure()
+            }
         }
     }
 
     val controller = JourneyController()
 
     init {
-        setBackgroundColor(BACKGROUND_COLOR)
+        setBackgroundColor(themeBackgroundColor())
+        context.applicationContext.registerComponentCallbacks(memoryCallbacks)
     }
 
     @JvmOverloads
@@ -85,49 +166,144 @@ class JourneyView @JvmOverloads constructor(
         listener: JourneyListener = object : JourneyListener {},
         controller: JourneyController = this.controller,
     ) {
+        prepare(configuration, listener, controller)
+        present()
+    }
+
+    /** Warm the Journey renderer and configuration without presenting or capturing. */
+    @JvmOverloads
+    fun prepare(
+        configuration: JourneyConfiguration,
+        listener: JourneyListener = object : JourneyListener {},
+        controller: JourneyController = this.controller,
+    ) {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "JourneyView.prepare must be called on the main thread"
+        }
+        val sameConfiguration = this.configuration == configuration && !disposed
+        if (!memoryCallbacksRegistered) {
+            context.applicationContext.registerComponentCallbacks(memoryCallbacks)
+            memoryCallbacksRegistered = true
+        }
         disposed = false
-        this.configuration = configuration
+        authorizationGate.allowExplicitAttempt()
         this.listener = listener
-        this.journeyConfig = null
-        this.rendererReady = false
-        this.canGoBack = false
-        this.currentStepId = null
-        this.currentStepIndex = 0
-        backCallback.isEnabled = false
-        queuedCommands.clear()
-        boundController?.sink = null
-        boundController = controller
-        showLoading()
-        IO_EXECUTOR.execute {
-            try {
-                configuration.resolvedRendererUrl()
-                val config = JourneyApiClient.fetchConfiguration(configuration)
-                mainHandler.post {
-                    if (disposed || this.configuration !== configuration) return@post
-                    journeyConfig = config
-                    createAndLoadWebView()
-                }
-            } catch (error: Throwable) {
-                postFailure("load_failed", error, true)
+        bindController(controller)
+        if (presented) {
+            if (!sameConfiguration) {
+                listener.onError(
+                    JourneyError(
+                        "configuration_active",
+                        "Dismiss the active Journey before changing its configuration",
+                        true,
+                    ),
+                )
             }
+            return
+        }
+        if (!sameConfiguration) resetForConfiguration(configuration)
+        setBackgroundColor(themeBackgroundColor())
+        visibility = if (presentationRequested) VISIBLE else INVISIBLE
+        readiness = JourneyReadiness.PREPARING
+        ensureWebView()
+        startPreparation(force = !sameConfiguration)
+    }
+
+    /** Present a prepared Journey. A stale preparation refreshes before its 30-minute limit. */
+    fun present() {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "JourneyView.present must be called on the main thread"
+        }
+        if (disposed || configuration == null) return
+        if (presented) return
+        if (authorizationGate.blocksAutomaticAttempts) {
+            authorizationGate.allowExplicitAttempt()
+            readiness = JourneyReadiness.PREPARING
+        }
+        val isNewPresentation = !presentationRequested
+        presentationRequested = true
+        if (isNewPresentation) resetPresentationDeadline()
+        visibility = VISIBLE
+        clearFailure()
+        showLoadingOverlay()
+        ensureWebView()
+        armPresentationDeadline()
+        val canStart = preparation?.let {
+            JourneyFreshness(preparedAtMillis, it.refreshAfterSeconds)
+                .canStart(SystemClock.elapsedRealtime())
+        } == true
+        if (preparedRendered && canStart) {
+            revealPreparedRenderer()
+            if (needsRefresh()) startPreparation(force = true)
+            return
+        }
+        if (!prepareInFlight && (preparation == null || !canStart || needsRefresh())) {
+            startPreparation(force = true)
+        }
+        attemptInitializeRenderer()
+    }
+
+    /** Hide the Journey while retaining and resetting the same renderer for the next presentation. */
+    fun dismiss() {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "JourneyView.dismiss must be called on the main thread"
+        }
+        resetPresentationDeadline()
+        presentationRequested = false
+        presented = false
+        canGoBack = false
+        backCallback.isEnabled = false
+        if (authorizationGate.blocksAutomaticAttempts) {
+            destroyWebView()
+            readiness = JourneyReadiness.BLOCKED
+            visibility = INVISIBLE
+        } else if (
+            rendererSupportsPreparation &&
+            rendererReady &&
+            preparation?.supportsPreparation == true
+        ) {
+            sendVisibility(false)
+            visibility = INVISIBLE
+            pendingPreparation?.let(::activatePreparation)
+            pendingPreparation = null
+            pendingPreparedAtMillis = 0L
+            val canResetFromCache = preparation?.let {
+                JourneyFreshness(preparedAtMillis, it.refreshAfterSeconds)
+                    .canStart(SystemClock.elapsedRealtime())
+            } == true
+            if (canResetFromCache) {
+                initializeRenderer(prepared = true)
+                scheduleRefresh()
+            } else {
+                rendererInitialized = false
+                preparedRendered = false
+                readiness = JourneyReadiness.PREPARING
+                startPreparation(force = true)
+            }
+        } else {
+            destroyWebView()
+            readiness = JourneyReadiness.IDLE
+            visibility = INVISIBLE
         }
     }
 
     fun dispose() {
         flushCaptureForLifecycle()
         disposed = true
+        readiness = JourneyReadiness.DISPOSED
+        preparationGeneration += 1
+        prepareInFlight = false
+        mainHandler.removeCallbacks(refreshRunnable)
+        finishPresentationDeadline()
         unbindPlatformLifecycle()
         boundController?.sink = null
         boundController = null
-        webView?.let { current ->
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-                runCatching { WebViewCompat.removeWebMessageListener(current, JourneyBridge.HANDLER) }
-            }
-            current.stopLoading()
-            current.webViewClient = WebViewClient()
-            current.destroy()
+        readinessListener = null
+        destroyWebView()
+        if (memoryCallbacksRegistered) {
+            runCatching { context.applicationContext.unregisterComponentCallbacks(memoryCallbacks) }
+            memoryCallbacksRegistered = false
         }
-        webView = null
         removeAllViews()
     }
 
@@ -151,32 +327,75 @@ class JourneyView @JvmOverloads constructor(
         return true
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun createAndLoadWebView() {
+    private fun resetForConfiguration(configuration: JourneyConfiguration) {
+        val rendererUrl = configuration.resolvedRendererUrl()
+        val hostChanged = loadedRendererUrl != null && loadedRendererUrl != rendererUrl
+        if (hostChanged || this.configuration?.identity != configuration.identity) destroyWebView()
+        this.configuration = configuration
+        journeyConfig = null
+        preparation = null
+        pendingPreparation = null
+        preparedAtMillis = 0L
+        pendingPreparedAtMillis = 0L
+        rendererInitialized = false
+        preparedRendered = false
+        presented = false
+        presentationRequested = false
+        resetPresentationDeadline()
+        retryAttempt = 0
+        retryNotBeforeMillis = 0L
+        authorizationGate.allowExplicitAttempt()
+        clientSessionId = null
+        canGoBack = false
+        currentStepId = null
+        currentStepIndex = 0
+        backCallback.isEnabled = false
+        queuedCommands.clear()
+    }
+
+    private fun bindController(controller: JourneyController) {
+        if (boundController === controller) return
+        boundController?.sink = null
+        boundController = controller
+        controller.sink = { command ->
+            if (rendererInitialized) send("command", command)
+            else queuedCommands.add(command)
+        }
+    }
+
+    // The first branch below returns unless WEB_MESSAGE_LISTENER is supported;
+    // lint does not carry that feature guard through the rest of this method.
+    @SuppressLint("SetJavaScriptEnabled", "RequiresFeature")
+    private fun ensureWebView() {
         val config = configuration ?: return
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            showFailure(
-                JourneyError(
-                    "unsupported_webview",
-                    "Android System WebView must be updated to display this Journey",
-                    true,
-                ),
+            val error = JourneyError(
+                "unsupported_webview",
+                "Android System WebView must be updated to display this Journey",
+                true,
             )
+            readiness = JourneyReadiness.FAILED
+            listener.onError(error)
+            if (presentationRequested) showFailure(error)
             return
         }
 
-        webView?.destroy()
+        val rendererUrl = config.resolvedRendererUrl()
+        if (webView != null && loadedRendererUrl == rendererUrl) return
+        destroyWebView()
         rendererReady = false
+        rendererSupportsPreparation = false
+        rendererInitialized = false
+        preparedRendered = false
         canGoBack = false
         backCallback.isEnabled = false
-        val rendererUrl = config.resolvedRendererUrl()
         val rendererUri = Uri.parse(rendererUrl)
         val origin = buildString {
             append(rendererUri.scheme).append("://").append(rendererUri.host)
             if (rendererUri.port != -1) append(":").append(rendererUri.port)
         }
         val current = WebView(context).apply {
-            setBackgroundColor(BACKGROUND_COLOR)
+            setBackgroundColor(themeBackgroundColor())
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.allowFileAccess = false
@@ -205,9 +424,11 @@ class JourneyView @JvmOverloads constructor(
             },
         )
         webView = current
+        loadedRendererUrl = rendererUrl
         removeAllViews()
         addView(current, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        showLoadingOverlay()
+        current.visibility = if (presentationRequested) VISIBLE else INVISIBLE
+        if (presentationRequested) showLoadingOverlay()
         current.loadUrl(rendererUrl)
     }
 
@@ -231,7 +452,14 @@ class JourneyView @JvmOverloads constructor(
                     true,
                 )
                 listener.onError(journeyError)
-                showFailure(journeyError)
+                rendererReady = false
+                rendererInitialized = false
+                loadedRendererUrl = null
+                if (presentationRequested) showFailure(journeyError)
+                else {
+                    readiness = JourneyReadiness.FAILED
+                    recordRetryBackoff()
+                }
             }
         }
 
@@ -239,6 +467,10 @@ class JourneyView @JvmOverloads constructor(
             removeView(view)
             view.destroy()
             webView = null
+            loadedRendererUrl = null
+            rendererReady = false
+            rendererInitialized = false
+            preparedRendered = false
             listener.onError(
                 JourneyError(
                     "renderer_process_gone",
@@ -246,7 +478,10 @@ class JourneyView @JvmOverloads constructor(
                     true,
                 ),
             )
-            if (!disposed) createAndLoadWebView()
+            if (!disposed) {
+                ensureWebView()
+                startPreparation(force = true)
+            }
             return true
         }
     }
@@ -267,9 +502,22 @@ class JourneyView @JvmOverloads constructor(
             when (message.type) {
                 "ready" -> {
                     rendererReady = true
-                    initializeRenderer()
+                    val capabilities = message.payload.optJSONArray("capabilities")
+                    rendererSupportsPreparation = capabilities != null &&
+                        (0 until capabilities.length()).map(capabilities::optString).containsAll(
+                            listOf("prepare", "visibility"),
+                        )
+                    attemptInitializeRenderer()
                 }
-                "rendered" -> hideLoadingOverlay()
+                "rendered" -> {
+                    preparedRendered = true
+                    if (presentationRequested) revealPreparedRenderer()
+                    else {
+                        readiness = JourneyReadiness.READY
+                        visibility = INVISIBLE
+                        hideLoadingOverlay()
+                    }
+                }
                 "navigation_state" -> {
                     currentStepId = message.payload.optString("stepId")
                     currentStepIndex = message.payload.optInt("stepIndex")
@@ -304,27 +552,223 @@ class JourneyView @JvmOverloads constructor(
         }
     }
 
-    private fun initializeRenderer() {
+    private fun startPreparation(force: Boolean) {
+        val config = configuration ?: return
+        if (
+            prepareInFlight ||
+            disposed ||
+            authorizationGate.blocksAutomaticAttempts ||
+            !foreground
+        ) return
+        val retryDelay = retryNotBeforeMillis - SystemClock.elapsedRealtime()
+        if (retryDelay > 0L) return
+        if (!force && preparation != null && !needsRefresh()) {
+            scheduleRefresh()
+            attemptInitializeRenderer()
+            return
+        }
+        prepareInFlight = true
+        if (!presented) readiness = JourneyReadiness.PREPARING
+        val generation = ++preparationGeneration
+        val knownRevisionId = latestPreparation()?.value?.revisionId
+        IO_EXECUTOR.execute {
+            try {
+                val result = JourneyApiClient.prepare(config, knownRevisionId)
+                mainHandler.post {
+                    if (disposed || generation != preparationGeneration || this.configuration !== config) {
+                        return@post
+                    }
+                    prepareInFlight = false
+                    retryAttempt = 0
+                    retryNotBeforeMillis = 0L
+                    val latestBeforeRefresh = latestPreparation()
+                    val resolved = try {
+                        JourneyApiClient.resolvePreparation(
+                            result = result,
+                            requestedRevisionId = knownRevisionId,
+                            existing = latestBeforeRefresh,
+                        )
+                    } catch (error: JourneyError) {
+                        handlePreparationFailure(error)
+                        return@post
+                    }
+                    if (resolved.config == null) {
+                        handlePreparationFailure(
+                            JourneyError(
+                                "invalid_config",
+                                "FounderHQ returned an invalid Journey configuration",
+                                false,
+                            ),
+                        )
+                        return@post
+                    }
+                    val now = SystemClock.elapsedRealtime()
+                    if (presented && (pendingPreparation != null || !result.unchanged)) {
+                        pendingPreparation = resolved
+                        pendingPreparedAtMillis = now
+                    } else {
+                        activatePreparation(resolved, now)
+                        if (!result.unchanged) {
+                            rendererInitialized = false
+                            preparedRendered = false
+                        }
+                    }
+                    scheduleRefresh()
+                    attemptInitializeRenderer()
+                }
+            } catch (error: Throwable) {
+                mainHandler.post {
+                    if (disposed || generation != preparationGeneration || this.configuration !== config) {
+                        return@post
+                    }
+                    prepareInFlight = false
+                    handlePreparationFailure(error)
+                }
+            }
+        }
+    }
+
+    private fun activatePreparation(
+        value: JourneyPreparation,
+        preparedAt: Long = pendingPreparedAtMillis.takeIf { it > 0L }
+            ?: SystemClock.elapsedRealtime(),
+    ) {
+        preparation = value
+        journeyConfig = value.config?.let { JSONObject(it.toString()) }
+        preparedAtMillis = preparedAt
+    }
+
+    private fun handlePreparationFailure(error: Throwable) {
+        val journeyError = error as? JourneyError ?: JourneyError(
+            "prepare_failed",
+            error.message ?: "Journey preparation failed",
+            true,
+            error,
+        )
+        listener.onError(journeyError)
+        journeyError.retryAfterMillis?.let { delay ->
+            extendRetryDeadline(delay)
+        }
+        if (mustStopForPreparationFailure(journeyError)) {
+            blockForDefinitiveDenial(journeyError)
+            return
+        }
+        if (presented) {
+            readiness = JourneyReadiness.PRESENTED
+            recordRetryBackoff()
+            return
+        }
+        val canStart = preparation?.let {
+            JourneyFreshness(preparedAtMillis, it.refreshAfterSeconds)
+                .canStart(SystemClock.elapsedRealtime())
+        } == true
+        if (preparedRendered && canStart) {
+            readiness = JourneyReadiness.READY
+            if (presentationRequested) revealPreparedRenderer()
+        } else {
+            readiness = JourneyReadiness.FAILED
+        }
+        recordRetryBackoff()
+        if (presentationRequested && failureView != null) showFailure(journeyError)
+    }
+
+    private fun recordRetryBackoff() {
+        if (!foreground || disposed || readiness == JourneyReadiness.BLOCKED) return
+        val backoff = RETRY_DELAYS_MILLIS[minOf(retryAttempt, RETRY_DELAYS_MILLIS.lastIndex)]
+        val serverDelay = (retryNotBeforeMillis - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        val delay = maxOf(backoff, serverDelay)
+        extendRetryDeadline(delay)
+        retryAttempt += 1
+    }
+
+    private fun extendRetryDeadline(delayMillis: Long) {
+        val now = SystemClock.elapsedRealtime()
+        val target = if (delayMillis > Long.MAX_VALUE - now) Long.MAX_VALUE else now + delayMillis
+        retryNotBeforeMillis = maxOf(retryNotBeforeMillis, target)
+    }
+
+    private fun needsRefresh(now: Long = SystemClock.elapsedRealtime()): Boolean {
+        val latest = latestPreparation() ?: return true
+        return JourneyFreshness(latest.preparedAtMillis, latest.value.refreshAfterSeconds)
+            .needsRefresh(now)
+    }
+
+    private fun scheduleRefresh() {
+        mainHandler.removeCallbacks(refreshRunnable)
+        val latest = latestPreparation() ?: return
+        if (!foreground || disposed) return
+        val elapsed = SystemClock.elapsedRealtime() - latest.preparedAtMillis
+        val delay = (latest.value.refreshAfterSeconds * 1_000L - elapsed).coerceAtLeast(0L)
+        mainHandler.postDelayed(refreshRunnable, delay)
+    }
+
+    private fun latestPreparation(): JourneyPreparationReference? = latestPreparationReference(
+        active = preparation,
+        activePreparedAtMillis = preparedAtMillis,
+        pending = pendingPreparation,
+        pendingPreparedAtMillis = pendingPreparedAtMillis,
+    )
+
+    private fun refreshIfNeeded() {
+        if (!foreground || disposed) return
+        if (needsRefresh()) startPreparation(force = true) else scheduleRefresh()
+    }
+
+    private fun attemptInitializeRenderer() {
+        if (!rendererReady || journeyConfig == null) return
+        val canStart = preparation?.let {
+            JourneyFreshness(preparedAtMillis, it.refreshAfterSeconds)
+                .canStart(SystemClock.elapsedRealtime())
+        } == true
+        if (!canStart) return
+        if (rendererInitialized) {
+            if (preparedRendered && presentationRequested) revealPreparedRenderer()
+            return
+        }
+        if (rendererSupportsPreparation && preparation?.supportsPreparation == true) {
+            initializeRenderer(prepared = true)
+        } else if (presentationRequested) {
+            initializeRenderer(prepared = false)
+        } else {
+            readiness = JourneyReadiness.DIRECT_PRESENTATION
+        }
+    }
+
+    private fun initializeRenderer(prepared: Boolean) {
         val config = configuration ?: return
         val renderedConfig = journeyConfig ?: return
-        val payload = JSONObject()
-            .put("journeyId", config.journeyId)
-            .put("config", renderedConfig)
-            .put("capture", config.capture?.toJson() ?: false)
-            .put("initialAnswers", config.initialAnswers)
-            .put("initialOptions", config.initialOptions)
-            .put("platform", "android")
-            .put("sdkVersion", JourneyBridge.SDK_VERSION)
-        config.identity?.let { payload.put("identity", it.toJson()) }
-        config.storageKey?.let { payload.put("storageKey", it) }
-        config.theme?.let { payload.put("theme", it) }
+        clientSessionId = UUID.randomUUID().toString()
+        rendererInitialized = true
+        preparedRendered = false
+        presented = false
+        canGoBack = false
+        backCallback.isEnabled = false
+        val payload = JourneyBridge.initializePayload(
+            configuration = config,
+            renderedConfig = renderedConfig,
+            clientSessionId = clientSessionId!!,
+            prepared = prepared,
+            revisionId = preparation?.revisionId,
+        )
         send("initialize", payload)
-        boundController?.sink = { command ->
-            if (rendererReady) send("command", command)
-            else queuedCommands.add(command)
-        }
         queuedCommands.forEach { send("command", it) }
         queuedCommands.clear()
+    }
+
+    private fun revealPreparedRenderer() {
+        if (!preparedRendered || !presentationRequested) return
+        if (rendererSupportsPreparation) sendVisibility(true)
+        webView?.visibility = VISIBLE
+        visibility = VISIBLE
+        presented = true
+        readiness = JourneyReadiness.PRESENTED
+        hideLoadingOverlay()
+        clearFailure()
+        finishPresentationDeadline()
+    }
+
+    private fun sendVisibility(visible: Boolean) {
+        send("command", JSONObject().put("name", "set_visibility").put("visible", visible))
     }
 
     private fun handleCapture(payload: JSONObject) {
@@ -334,15 +778,28 @@ class JourneyView @JvmOverloads constructor(
         if (requestId.isBlank()) return
         IO_EXECUTOR.execute {
             val response = JSONObject().put("requestId", requestId)
+            var captureError: JourneyError? = null
             try {
                 val status = JourneyApiClient.capture(config, body)
                 response.put("ok", true).put("status", status)
             } catch (error: Throwable) {
-                response
-                    .put("ok", false)
-                    .put("error", error.message ?: "Capture failed")
+                captureError = error as? JourneyError
+                val failure = JourneyBridge.captureErrorResponse(requestId, error)
+                response.put("ok", false).put("error", failure.getString("error"))
+                if (failure.has("retryAfterMs")) {
+                    response.put("retryAfterMs", failure.getLong("retryAfterMs"))
+                }
             }
-            mainHandler.post { if (!disposed) send("capture_response", response) }
+            mainHandler.post {
+                if (disposed) return@post
+                send("capture_response", response)
+                captureError?.let { error ->
+                    listener.onError(error)
+                    if (error.httpStatus in DEFINITIVE_HTTP_STATUSES) {
+                        mainHandler.post { blockForDefinitiveDenial(error) }
+                    }
+                }
+            }
         }
     }
 
@@ -363,16 +820,29 @@ class JourneyView @JvmOverloads constructor(
         }
     }
 
+    private fun blockForDefinitiveDenial(error: JourneyError) {
+        if (disposed) return
+        authorizationGate.block()
+        presentationRequested = false
+        presented = false
+        preparationGeneration += 1
+        prepareInFlight = false
+        preparation = null
+        pendingPreparation = null
+        journeyConfig = null
+        preparedAtMillis = 0L
+        pendingPreparedAtMillis = 0L
+        mainHandler.removeCallbacks(refreshRunnable)
+        mainHandler.removeCallbacks(presentationDeadline)
+        destroyWebView()
+        readiness = JourneyReadiness.BLOCKED
+        visibility = VISIBLE
+        showFailure(error)
+    }
+
     private fun send(type: String, payload: JSONObject) {
         if (!rendererReady && type != "initialize") return
         webView?.evaluateJavascript(JourneyBridge.dispatchScript(type, payload), null)
-    }
-
-    private fun showLoading() {
-        removeAllViews()
-        val view = createLoadingView()
-        loadingView = view
-        addView(view, loadingLayoutParams(view))
     }
 
     private fun showLoadingOverlay() {
@@ -388,56 +858,140 @@ class JourneyView @JvmOverloads constructor(
         loadingView = null
     }
 
-    private fun createLoadingView(): View = loadingViewFactory?.invoke(context) ?: ProgressBar(context)
+    private fun createLoadingView(): View = loadingViewFactory?.invoke(context) ?: run {
+        val ringColor = themeAccentColor()
+        if (Build.VERSION.SDK_INT >= 26 && !ValueAnimator.areAnimatorsEnabled()) {
+            JourneyStaticRingView(context, ringColor)
+        } else {
+            ProgressBar(context).apply {
+                contentDescription = "Loading Journey"
+                isFocusable = true
+                indeterminateTintList = ColorStateList.valueOf(ringColor)
+            }
+        }
+    }
 
     private fun loadingLayoutParams(view: View): LayoutParams =
-        if (view is ProgressBar) {
+        if (view is ProgressBar || view is JourneyStaticRingView) {
             LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER)
         } else {
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         }
 
     private fun retryCurrentConfiguration() {
-        val config = configuration ?: return
-        load(config, listener, boundController ?: controller)
+        if (
+            configuration == null ||
+            disposed ||
+            SystemClock.elapsedRealtime() < retryNotBeforeMillis
+        ) return
+        authorizationGate.allowExplicitAttempt()
+        clearFailure()
+        rendererInitialized = false
+        preparedRendered = false
+        readiness = JourneyReadiness.PREPARING
+        ensureWebView()
+        resetPresentationDeadline()
+        startPreparation(force = true)
+        present()
+    }
+
+    private fun resetPresentationDeadline() {
+        mainHandler.removeCallbacks(presentationDeadline)
+        presentationDeadlineBudget.reset()
+    }
+
+    private fun armPresentationDeadline() {
+        if (
+            !foreground ||
+            !presentationRequested ||
+            presented ||
+            disposed ||
+            failureView != null
+        ) return
+        val remaining = presentationDeadlineBudget.start(SystemClock.elapsedRealtime()) ?: return
+        if (remaining <= 0L) {
+            presentationDeadline.run()
+            return
+        }
+        mainHandler.postDelayed(presentationDeadline, remaining)
+    }
+
+    private fun pausePresentationDeadline() {
+        mainHandler.removeCallbacks(presentationDeadline)
+        presentationDeadlineBudget.pause(SystemClock.elapsedRealtime())
+    }
+
+    private fun finishPresentationDeadline() {
+        mainHandler.removeCallbacks(presentationDeadline)
+        presentationDeadlineBudget.finish()
     }
 
     private fun showFailure(error: JourneyError) {
-        webView?.let { current ->
-            removeView(current)
-            current.stopLoading()
-            current.destroy()
-        }
-        webView = null
-        removeAllViews()
-        loadingView = null
+        finishPresentationDeadline()
+        hideLoadingOverlay()
+        clearFailure()
+        visibility = VISIBLE
         val retry = ::retryCurrentConfiguration
         errorViewFactory?.invoke(context, error, retry)?.let { custom ->
+            failureView = custom
             addView(custom, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+            custom.bringToFront()
             return
         }
-        addView(
-            TextView(context).apply {
-                text = "This Journey is unavailable\n\n${error.message}"
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setPadding(48, 48, 48, 48)
-                setOnClickListener { retry() }
-            },
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
-        )
+        val retryDelay = (retryNotBeforeMillis - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        val retryButton = Button(context).apply {
+            text = "Try again"
+            contentDescription = "Try loading the Journey again"
+            isEnabled = !prepareInFlight && retryDelay == 0L
+            setOnClickListener { retry() }
+        }
+        val view = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(themeBackgroundColor())
+            setPadding(dp(32), dp(32), dp(32), dp(32))
+            addView(
+                ImageView(context).apply {
+                    setImageResource(android.R.drawable.ic_dialog_alert)
+                    setColorFilter(themeTextColor())
+                    contentDescription = null
+                },
+                LinearLayout.LayoutParams(dp(28), dp(28)).apply { bottomMargin = dp(16) },
+            )
+            addView(
+                TextView(context).apply {
+                    text = GENERIC_ERROR
+                    gravity = Gravity.CENTER
+                    setTextColor(themeTextColor())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { bottomMargin = dp(16) },
+            )
+            addView(
+                retryButton,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            if (retryDelay > 0L) {
+                val currentView = this
+                mainHandler.postDelayed({
+                    if (failureView === currentView && !prepareInFlight) retryButton.isEnabled = true
+                }, retryDelay)
+            }
+        }
+        failureView = view
+        addView(view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        view.bringToFront()
     }
 
-    private fun postFailure(code: String, error: Throwable, recoverable: Boolean) {
-        mainHandler.post {
-            if (disposed) return@post
-            showFailure(
-                JourneyError(code, error.message ?: "Journey failed to load", recoverable, error),
-            )
-            listener.onError(
-                JourneyError(code, error.message ?: "Journey failed to load", recoverable, error),
-            )
-        }
+    private fun clearFailure() {
+        failureView?.let(::removeView)
+        failureView = null
     }
 
     private fun openUrl(uri: Uri) {
@@ -492,9 +1046,40 @@ class JourneyView @JvmOverloads constructor(
         backCallback.remove()
     }
 
+    private fun destroyWebView() {
+        webView?.let { current ->
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                runCatching { WebViewCompat.removeWebMessageListener(current, JourneyBridge.HANDLER) }
+            }
+            current.stopLoading()
+            current.webViewClient = WebViewClient()
+            current.destroy()
+        }
+        webView = null
+        loadedRendererUrl = null
+        rendererReady = false
+        rendererSupportsPreparation = false
+        rendererInitialized = false
+        preparedRendered = false
+        clearFailure()
+        hideLoadingOverlay()
+    }
+
+    private fun releasePreparedRendererForMemoryPressure() {
+        if (disposed || presented || presentationRequested) return
+        destroyWebView()
+        preparation = null
+        journeyConfig = null
+        preparedAtMillis = 0L
+        readiness = JourneyReadiness.IDLE
+    }
+
     companion object {
         private val IO_EXECUTOR = Executors.newCachedThreadPool()
-        private val BACKGROUND_COLOR = Color.rgb(20, 18, 16)
+        private const val GENERIC_ERROR = "Unable to load. Please try again."
+        private const val PRESENTATION_DEADLINE_MILLIS = 15_000L
+        private val RETRY_DELAYS_MILLIS = longArrayOf(1_000L, 2_000L, 5_000L, 15_000L, 30_000L, 60_000L)
+        private val DEFINITIVE_HTTP_STATUSES = setOf(401, 403, 404)
     }
 
     private fun sameOrigin(first: Uri, second: Uri): Boolean =
@@ -507,5 +1092,57 @@ class JourneyView @JvmOverloads constructor(
         uri.scheme.equals("https", ignoreCase = true) -> 443
         uri.scheme.equals("http", ignoreCase = true) -> 80
         else -> -1
+    }
+
+    private fun isDarkTheme(): Boolean = when (configuration?.theme?.lowercase()) {
+        "dark" -> true
+        "light" -> false
+        else -> resources.configuration.uiMode and AndroidConfiguration.UI_MODE_NIGHT_MASK ==
+            AndroidConfiguration.UI_MODE_NIGHT_YES
+    }
+
+    private fun themeBackgroundColor(): Int =
+        if (isDarkTheme()) Color.rgb(20, 18, 24) else Color.rgb(250, 249, 252)
+
+    private fun themeTextColor(): Int =
+        if (isDarkTheme()) Color.rgb(246, 243, 250) else Color.rgb(31, 27, 36)
+
+    private fun themeAccentColor(): Int =
+        if (isDarkTheme()) Color.rgb(190, 177, 255) else Color.rgb(91, 70, 210)
+
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics)
+            .toInt()
+}
+
+private class JourneyStaticRingView(context: Context, color: Int) : View(context) {
+    private val size = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP,
+        32f,
+        resources.displayMetrics,
+    ).toInt()
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            3f,
+            resources.displayMetrics,
+        )
+        this.color = color
+    }
+
+    init {
+        contentDescription = "Loading Journey"
+        isFocusable = true
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        setMeasuredDimension(resolveSize(size, widthMeasureSpec), resolveSize(size, heightMeasureSpec))
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val inset = paint.strokeWidth / 2f
+        canvas.drawCircle(width / 2f, height / 2f, minOf(width, height) / 2f - inset, paint)
     }
 }

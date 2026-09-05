@@ -58,3 +58,111 @@ data class JourneyCaptureTransportRequest(
     val method: String,
     val body: JSONObject,
 )
+
+data class JourneyPreparation(
+    val config: JSONObject?,
+    val revisionId: String,
+    val version: Int,
+    val captureIdentityMode: String,
+    val refreshAfterSeconds: Long,
+    val unchanged: Boolean,
+    internal val supportsPreparation: Boolean = true,
+) {
+    companion object {
+        const val MIN_REFRESH_SECONDS = 600L
+        const val MAX_REFRESH_SECONDS = 1_800L
+        const val MAXIMUM_START_AGE_MILLIS = 30 * 60 * 1_000L
+    }
+
+    internal fun clamped() = copy(
+        refreshAfterSeconds = refreshAfterSeconds.coerceIn(
+            MIN_REFRESH_SECONDS,
+            MAX_REFRESH_SECONDS,
+        ),
+    )
+}
+
+enum class JourneyReadiness {
+    IDLE,
+    PREPARING,
+    READY,
+    DIRECT_PRESENTATION,
+    PRESENTED,
+    FAILED,
+    BLOCKED,
+    DISPOSED,
+}
+
+internal data class JourneyFreshness(
+    val preparedAtMillis: Long,
+    val refreshAfterSeconds: Long,
+) {
+    fun needsRefresh(nowMillis: Long): Boolean =
+        nowMillis - preparedAtMillis >= refreshAfterSeconds.coerceIn(
+            JourneyPreparation.MIN_REFRESH_SECONDS,
+            JourneyPreparation.MAX_REFRESH_SECONDS,
+        ) * 1_000L
+
+    fun canStart(nowMillis: Long): Boolean =
+        nowMillis - preparedAtMillis <= JourneyPreparation.MAXIMUM_START_AGE_MILLIS
+}
+
+internal class JourneyForegroundDeadline(private val totalMillis: Long) {
+    var remainingMillis: Long = totalMillis
+        private set
+    private var startedAtMillis: Long? = null
+
+    fun reset() {
+        remainingMillis = totalMillis
+        startedAtMillis = null
+    }
+
+    fun start(nowMillis: Long): Long? {
+        if (startedAtMillis != null) return null
+        startedAtMillis = nowMillis
+        return remainingMillis
+    }
+
+    fun pause(nowMillis: Long) {
+        val startedAt = startedAtMillis ?: return
+        remainingMillis = (remainingMillis - (nowMillis - startedAt)).coerceAtLeast(0L)
+        startedAtMillis = null
+    }
+
+    fun finish() {
+        remainingMillis = 0L
+        startedAtMillis = null
+    }
+}
+
+internal data class JourneyPreparationReference(
+    val value: JourneyPreparation,
+    val preparedAtMillis: Long,
+)
+
+internal fun latestPreparationReference(
+    active: JourneyPreparation?,
+    activePreparedAtMillis: Long,
+    pending: JourneyPreparation?,
+    pendingPreparedAtMillis: Long,
+): JourneyPreparationReference? = when {
+    pending != null -> JourneyPreparationReference(pending, pendingPreparedAtMillis)
+    active != null -> JourneyPreparationReference(active, activePreparedAtMillis)
+    else -> null
+}
+
+internal fun mustStopForPreparationFailure(error: JourneyError): Boolean =
+    !error.recoverable || error.code == "authorization_denied"
+
+internal class JourneyAuthorizationGate {
+    var blocksAutomaticAttempts: Boolean = false
+        private set
+
+    fun block() {
+        blocksAutomaticAttempts = true
+    }
+
+    fun allowExplicitAttempt() {
+        blocksAutomaticAttempts = false
+    }
+}
