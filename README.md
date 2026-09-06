@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:journeys:0.8.0")
+implementation("com.getfounderhq:journeys:0.8.1")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:journeys-compose:0.8.0")
+implementation("com.getfounderhq:journeys-compose:0.8.1")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -92,6 +92,10 @@ The core View exposes `loadingViewFactory`, `errorViewFactory`,
 consumers can configure the underlying View with `configureView`.
 
 ## Release notes
+
+### 0.8.1
+
+Forward the WebView’s measured overlap with system bars and display cutouts to the renderer. This keeps progress and navigation clear of the status bar on older Android WebViews without insetting the background. Insets update when layout or system bars change.
 
 ### 0.8.0
 

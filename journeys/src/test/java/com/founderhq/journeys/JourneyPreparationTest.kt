@@ -206,7 +206,7 @@ class JourneyPreparationTest {
         assertEquals("prepared", payload.getString("presentationMode"))
         assertEquals("revision-2", payload.getString("revisionId"))
         assertEquals("session-1", payload.getString("clientSessionId"))
-        assertEquals("0.8.0", payload.getString("sdkVersion"))
+        assertEquals("0.8.1", payload.getString("sdkVersion"))
     }
 
     @Test

@@ -20,6 +20,8 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewTreeObserver
+import android.view.WindowInsets
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -34,6 +36,8 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.findViewTreeLifecycleOwner
@@ -97,6 +101,10 @@ class JourneyView @JvmOverloads constructor(
     private val queuedCommands = mutableListOf<JSONObject>()
     private var loadingView: View? = null
     private var lifecycleOwner: LifecycleOwner? = null
+    private var lastSafeArea: JourneySafeArea? = null
+    private val safeAreaLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+        syncRendererSafeArea()
+    }
 
     private val refreshRunnable = Runnable { refreshIfNeeded() }
     private val presentationDeadline = Runnable {
@@ -308,6 +316,7 @@ class JourneyView @JvmOverloads constructor(
     }
 
     override fun onDetachedFromWindow() {
+        viewTreeObserver.removeOnGlobalLayoutListener(safeAreaLayoutListener)
         flushCaptureForLifecycle()
         unbindPlatformLifecycle()
         super.onDetachedFromWindow()
@@ -316,8 +325,39 @@ class JourneyView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        viewTreeObserver.addOnGlobalLayoutListener(safeAreaLayoutListener)
+        requestApplyInsets()
         bindPlatformLifecycle()
         webView?.onResume()
+    }
+
+    override fun onApplyWindowInsets(insets: WindowInsets): WindowInsets {
+        val result = super.onApplyWindowInsets(insets)
+        post { syncRendererSafeArea() }
+        return result
+    }
+
+    private fun syncRendererSafeArea() {
+        if (!rendererReady) return
+        val view = webView ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val root = view.rootView
+        val bars = ViewCompat.getRootWindowInsets(view)?.getInsets(
+            WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+        ) ?: return
+        val location = IntArray(2)
+        val rootLocation = IntArray(2)
+        view.getLocationOnScreen(location)
+        root.getLocationOnScreen(rootLocation)
+        val area = JourneySafeArea.overlapping(
+            bars.top, bars.right, bars.bottom, bars.left,
+            location[0] - rootLocation[0], location[1] - rootLocation[1],
+            view.width, view.height, root.width, root.height,
+            resources.displayMetrics.density,
+        )
+        if (area == lastSafeArea) return
+        lastSafeArea = area
+        view.evaluateJavascript(area.script(), null)
     }
 
     /** Consumes Android Back when the Journey can navigate backward. */
@@ -502,6 +542,8 @@ class JourneyView @JvmOverloads constructor(
             when (message.type) {
                 "ready" -> {
                     rendererReady = true
+                    lastSafeArea = null
+                    syncRendererSafeArea()
                     val capabilities = message.payload.optJSONArray("capabilities")
                     rendererSupportsPreparation = capabilities != null &&
                         (0 until capabilities.length()).map(capabilities::optString).containsAll(
