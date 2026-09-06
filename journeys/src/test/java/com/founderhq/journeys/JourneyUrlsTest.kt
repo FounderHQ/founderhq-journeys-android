@@ -7,6 +7,15 @@ import org.json.JSONObject
 
 class JourneyUrlsTest {
     @Test
+    fun productionAPIAndRendererUseAppHost() {
+        val configuration = JourneyConfiguration(apiKey = "fhq_pk_test", journeyId = "journey")
+        assertEquals("https://app.getfounderhq.com", configuration.resolvedBaseUrl())
+        assertEquals("https://app.getfounderhq.com/embed/journeys/native", configuration.resolvedRendererUrl())
+        assertEquals("http://10.0.2.2:3000/embed/journeys/native", configuration.copy(baseUrl = "http://10.0.2.2:3000").resolvedRendererUrl())
+        assertEquals("https://renderer.example.com/custom", configuration.copy(rendererUrl = "https://renderer.example.com/custom").resolvedRendererUrl())
+    }
+
+    @Test
     fun acceptsSecureAndLocalOrigins() {
         assertEquals("https://example.com", JourneyUrls.secureOrigin("https://example.com/path"))
         assertEquals("http://10.0.2.2:3000", JourneyUrls.secureOrigin("http://10.0.2.2:3000/path"))

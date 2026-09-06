@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:journeys:0.7.0")
+implementation("com.getfounderhq:journeys:0.8.0")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:journeys-compose:0.7.0")
+implementation("com.getfounderhq:journeys-compose:0.8.0")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -90,3 +90,16 @@ bodies are forwarded unchanged so renderer queue metadata reaches the server.
 The core View exposes `loadingViewFactory`, `errorViewFactory`,
 `hapticHandler`, `handleBackPressed()`, and current navigation state. Compose
 consumers can configure the underlying View with `configureView`.
+
+## Release notes
+
+### 0.8.0
+
+- Journey API requests and renderer pages use `https://app.getfounderhq.com`. The analytics ingest host is reserved for Events.
+
+### API and renderer hosts
+
+Production API requests use `https://app.getfounderhq.com`. The native WebView
+loads `https://app.getfounderhq.com/embed/journeys/native`, where the renderer
+and its assets are hosted. Custom/local API origins retain a renderer on that
+origin by default; an explicit renderer URL overrides it.

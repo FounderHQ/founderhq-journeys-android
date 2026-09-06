@@ -6,7 +6,7 @@ internal object JourneyBridge {
     const val VERSION = 1
     const val HANDLER = "founderhqJourneysNative"
     const val RECEIVER = "__founderhqJourneysReceive"
-    const val SDK_VERSION = "0.7.0"
+    const val SDK_VERSION = "0.8.0"
 
     data class Message(val type: String, val payload: JSONObject)
 
